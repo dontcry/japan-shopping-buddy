@@ -47,6 +47,7 @@ def fetch():
     errors = []
     for source, url, rates_key in SOURCES:
         try:
+            # 汇率 API 属全球 CDN，无需日本代理，直连即可
             status, text = http_request("GET", url, use_proxy=False, timeout=12)
             if status == 200:
                 data = json.loads(text)

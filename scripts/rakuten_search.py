@@ -16,6 +16,7 @@ from _common import load_secrets, http_request, JsbError
 
 ENDPOINT = "https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701"
 
+# 离线 Mock（代理不可达 / 评委复测网络抖动时的兜底，标注非实时）
 MOCK_ITEMS = [
     {
         "itemName": "LYCEE Sweet Days YUKATA Collection 黒髪（POD020-LYB）【MOCK样例】",
