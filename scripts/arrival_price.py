@@ -31,6 +31,10 @@ DEFAULT_RATE = 0.04224
 
 
 def estimate(price_jpy, channel="ems", domestic_jpy=0.0, rate=None, refresh_rate=True):
+    if price_jpy <= 0:
+        raise JsbError(f"price_jpy 必须为正数（当前 {price_jpy}）")
+    if domestic_jpy < 0:
+        raise JsbError(f"domestic_jpy 不能为负（当前 {domestic_jpy}）")
     ch = FORWARDING.get(channel)
     if not ch:
         raise JsbError(f"未知转运线路：{channel}（可选 {', '.join(FORWARDING)}）")
