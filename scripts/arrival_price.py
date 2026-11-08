@@ -150,6 +150,8 @@ def main():
     ap.add_argument("--condition", default="", help="成色（写入确认单）")
     ap.add_argument("--confidence", default="", help="同款匹配置信度：高/中/低")
     ap.add_argument("--caveats", action="append", default=[], help="追加 Caveats，可重复")
+    ap.add_argument("--weight-kg", type=float, default=None,
+                    help="申报重量（kg）。内置价目表仅覆盖 ≤1.5kg 小件，超重会给出警告")
     args = ap.parse_args()
 
     try:
@@ -162,6 +164,13 @@ def main():
         raise SystemExit(1)
 
     result["status"] = "current"
+    if args.weight_kg is not None:
+        result["weight_kg"] = args.weight_kg
+        if args.weight_kg > 1.5:
+            result["weight_warning"] = (
+                f"申报重量 {args.weight_kg}kg 超出内置价目表适用范围（≤1.5kg 小件）："
+                "下方转运费区间仅按小件价目估算，重物（家电/家具等）请以转送JAPAN 官网实时报价为准。")
+            args.caveats.append(result["weight_warning"])
     if args.quote:
         result["quote_md"] = build_quote_md(
             result, item_name=args.item_name, platform=args.platform,

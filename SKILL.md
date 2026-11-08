@@ -17,7 +17,7 @@ description: >-
 ## 指令（按顺序执行，Pipeline 模式）
 1. **识别**：解析链接/截图，译出商品名、成色、价格、瑕疵描述与平台来源。若价格非日元（如 Amazon 按收货地自动显示 HKD/SGD），先反推日元原价；信息不足或收货地不明时先追问（收货地决定直邮 vs 转运与税差，必须问清）。
 2. **路由**：按「渠道路由决策树」（见 references/channel_routing.md）判断最优渠道。
-3. **比价**：先判断入口类型（**单品页 / 搜索结果页 / 榜单页**三种入口解析路径不同：单品页取主购买价、搜索页取列表价与包邮信息、榜单页取排名与样本价，见 references/channel_routing.md），再按渠道查价：优先调一手 API（乐天 RWS，脚本 scripts/rakuten_search.py）查同款/近似款行情；Amazon 走页面快照兜底（curl 走代理 + 浏览器 UA + `/-/en/` 英文路径可突破反爬，解析标题与主购买价）；Yahoo 因注册门槛放弃，降级为代拍中转 / 页面快照兜底；二手/中古源（Mercari / 雅虎拍卖 / 骏河屋）走代拍中转或降级为预置参考价、链接文字识别（见 references/fallback_cache.md）。**必须读取脚本返回的 `status`**：`current`=实时数据可引用；`empty`=API 正常但确实查无此款（可下"无同款"结论）；`unavailable`=降级/失败（严禁表述为"没货/查无此商品"，只能说明数据暂不可用）。
+3. **比价**：先判断入口类型（**单品页 / 搜索结果页 / 榜单页**三种入口解析路径不同：单品页取主购买价、搜索页取列表价与包邮信息、榜单页取排名与样本价，见 references/channel_routing.md），再按渠道查价：优先调一手 API（乐天 RWS，脚本 scripts/rakuten_search.py）查同款/近似款行情；Amazon 走页面快照兜底（scripts/amazon_jp_snapshot.py，代理 + 浏览器 UA + `/-/en/` 路径可突破反爬取回完整页；**能取到标题/评分/榜单，但主购买价由前端 JS 注入，HTTP 快照常拿不到价** → 返回 `status=empty / code=PRICE_MISSING`，此时由 Agent 用浏览器渲染补价或改用乐天 RWS，**绝不拿推荐位/轮播价冒充主价**）；Yahoo 因注册门槛放弃，降级为代拍中转 / 页面快照兜底；二手/中古源（Mercari / 雅虎拍卖 / 骏河屋）走代拍中转或降级为预置参考价、链接文字识别（见 references/fallback_cache.md）。**必须读取脚本返回的 `status`**：`current`=实时数据可引用；`empty`=API 正常但确实查无此款（可下"无同款"结论）；`unavailable`=降级/失败（严禁表述为"没货/查无此商品"，只能说明数据暂不可用）。
 4. **试算**：用到手价公式（references/price_formula.md）+ 转运价目（references/forwarding_rates.md），脚本 scripts/arrival_price.py 汇总，标注估算口径 + 汇率快照时间戳。
 5. **确认单（脚本生成，模型只转述）**：`python3 arrival_price.py --price-jpy N --channel echina --quote --quote-file quote.md --item-name "…" --platform "…" --condition "…" --confidence "高/中/低"` 直接产出整张购买确认单（明细+Caveats+估算声明），交用户确认（Reviewer 卡点）。**模型不得自行填写或改写任何金额**，只负责转述脚本产出的 quote.md 内容。
 6. **购买指引**：用户确认后，给出原平台购买链接 / 代拍商下单指引，由用户自行完成购买；Skill 全程不代收代付、不自动下单。
@@ -30,6 +30,7 @@ description: >-
 | scripts/rakuten_search.py | 乐天 RWS 商品搜索/比价（默认走本机代理 127.0.0.1:7890） | `RAKUTEN_APPLICATION_ID=.. RAKUTEN_ACCESS_KEY=.. python3 rakuten_search.py "フィギュア" --hits 5` |
 | scripts/exchange_rate.py | JPY→CNY 汇率（双源 + 缓存 + 兜底） | `python3 exchange_rate.py` |
 | scripts/arrival_price.py | 到手价试算（商品+转运+手续费+关税），可 `--quote` 直接产出确认单 | `python3 arrival_price.py --price-jpy 16500 --channel ems --quote --quote-file quote.md` |
+| scripts/amazon_jp_snapshot.py | Amazon Japan 页面快照（标题/评分/榜单/价格尝试；`--bestsellers` 可用于榜单抽样） | `python3 amazon_jp_snapshot.py --asin B0G56GGKKK` |
 
 ## 数据可信度契约（provenance 硬约束）
 
@@ -68,6 +69,9 @@ description: >-
 - 一手比价 API（乐天）只有搜索/行情，无下单/库存 API → 成交由用户自行到原平台 / 代拍商完成，Skill 只负责识别、比价、试算与确认单。
 - 中古源（骏河屋/Mercari 等）可能被 Cloudflare 403 → 降级为预置参考价或链接文字识别。
 - 成色/瑕疵说明是识别推断，非实际值 → 必须标注「估算/待核实」。
+- 日亚页面里混着大量推荐位/轮播价（实测同页出现 ¥2,021 / ¥3,313 / ¥8,716 等无关价）→ **只允许从主购买区取价**；取不到就报 `PRICE_MISSING`，绝不拿旁边"相似商品"的价格充数。
+- 内置转运价目表只覆盖 **≤1.5kg 小件**（衣类/文具/手办）→ 家电、家具、整箱等重物必须传 `--weight-kg`，超 1.5kg 会在确认单里追加「重物请以转运商官网报价为准」警告；否则会严重低估转运费（实战：3合电饭煲约 6kg，按小件价目算出的运费只有实际的一半左右）。
+- 同一关键词下成色混杂（如"パナソニック 炊飯器"结果里既有 ¥3,740 的配件、也有 ¥29,222 的中古整机）→ 比价必须先按品类/成色分流，不能把配件价当整机价。
 - 平台边界：Temu 日本版（中国低价出海，非日本本土商品）、NETSEA/SuperDelivery（B2B 批发）不纳入比价路由，避免误判为日淘货源。
 
 ## 禁止行为
