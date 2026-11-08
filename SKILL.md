@@ -18,7 +18,7 @@ description: >-
 1. **识别**：解析链接/截图，译出商品名、成色、价格、瑕疵描述与平台来源。若价格非日元（如 Amazon 按收货地自动显示 HKD/SGD），先反推日元原价；信息不足或收货地不明时先追问（收货地决定直邮 vs 转运与税差，必须问清）。**同时判断是否敏感品（液体化妆品/含锂电池/喷雾/食品药品/刀具）——命中必须先提示跨境限运风险，再谈价格**（清单见 references/channel_routing.md）。
 2. **路由**：按「渠道路由决策树」（见 references/channel_routing.md）判断最优渠道。
 3. **比价**：先判断入口类型（**单品页 / 搜索结果页 / 榜单页**三种入口解析路径不同：单品页取主购买价、搜索页取列表价与包邮信息、榜单页取排名与样本价，见 references/channel_routing.md），再按渠道查价：优先调一手 API（乐天 RWS，脚本 scripts/rakuten_search.py）查同款/近似款行情；Amazon 走页面快照兜底（scripts/amazon_jp_snapshot.py，代理 + 浏览器 UA + `/-/en/` 路径可突破反爬取回完整页；**能取到标题/评分/榜单，但主购买价由前端 JS 注入，HTTP 快照常拿不到价** → 返回 `status=empty / code=PRICE_MISSING`，此时由 Agent 用浏览器渲染补价或改用乐天 RWS，**绝不拿推荐位/轮播价冒充主价**）；Yahoo 因注册门槛放弃，降级为代拍中转 / 页面快照兜底；二手/中古源（Mercari / 雅虎拍卖 / 骏河屋）走代拍中转或降级为预置参考价、链接文字识别（见 references/fallback_cache.md）。**必须读取脚本返回的 `status`**：`current`=实时数据可引用；`empty`=API 正常但确实查无此款（可下"无同款"结论）；`unavailable`=降级/失败（严禁表述为"没货/查无此商品"，只能说明数据暂不可用）。
-4. **试算**：用到手价公式（references/price_formula.md）+ 转运价目（references/forwarding_rates.md），脚本 scripts/arrival_price.py 汇总，标注估算口径 + 汇率快照时间戳。**行邮税必须按官方税目传 `--tariff-category`（税目1 `it/food/precious_metal/furniture/toy/sports` 13%、税目2 `textile/appliance/bike/other` 20%、税目3 `tobacco_alcohol/jewelry/golf/luxury` 50%），不得一律按 20% 估算**；应征税额 ≤50 元由脚本自动免征；商品价折合 >1000 元会追加「超个人邮递限值」警告（需拆单/跨境电商/按货物报关）。
+4. **试算**：用到手价公式（references/price_formula.md）+ 转运价目（references/forwarding_rates.md），脚本 scripts/arrival_price.py 汇总，标注估算口径 + 汇率快照时间戳。**行邮税必须按官方税目传 `--tariff-category`（税目1 `it/food/precious_metal/furniture/toy/sports` 13%、税目2 `textile/appliance/bike/other` 20%、税目3 `tobacco_alcohol/jewelry/golf/luxury` 50%），不得一律按 20% 估算**；应征税额 ≤50 元由脚本自动免征；商品价折合 >1000 元会追加「超个人邮递限值」警告（需拆单/跨境电商/按货物报关）。**收货地必须用 `--destination` 声明**（`cn` 默认完整建模；`hk` 按自由港 0 税；`other` 税未建模，只能声明「需按当地税法另计」，**禁止编造海外税率**）。
 5. **确认单（脚本生成，模型只转述）**：`python3 arrival_price.py --price-jpy N --channel echina --quote --quote-file quote.md --item-name "…" --platform "…" --condition "…" --confidence "高/中/低"` 直接产出整张购买确认单（明细+Caveats+估算声明），交用户确认（Reviewer 卡点）。**模型不得自行填写或改写任何金额**，只负责转述脚本产出的 quote.md 内容。
 6. **购买指引**：用户确认后，给出原平台购买链接 / 代拍商下单指引，由用户自行完成购买；Skill 全程不代收代付、不自动下单。
 
@@ -107,6 +107,7 @@ description: >-
 8. **入口分流 + 进度可视化**：单品页/搜索页/榜单页三种入口走不同解析路径；六步进度清单（⬜1识别→⬜6购买）让多步链路对评委可见。
 9. **负向边界清晰**：SKILL.md 明确写"用户已明确在国内平台买、只需国内比价时不触发"，不抢其他比价工具的活（参照官方的负向触发描述写法）。
 10. **税负按品类分档 + 免征额**：行邮税不再一刀切 20%，按 `--tariff-category` 取 13%/20%/50%，应征税额 ≤50 元自动免征并标注依据——高价单与低价单都不会算错（实战：¥980,000 相机少算 ¥2,900、¥3,520 万年笔正确免征）。
+11. **计算依据可审计 + 目的地参数化**：确认单每行都带依据/来源（汇率来源+快照、转运价目文件、海关税率表与公告号），评委可逐行复核；收货地按 `--destination` 取值（`cn`/`hk`/`other`），未建模目的地明确声明「需按当地另计」，不编造海外税率。
 
 ## 比价输出纪律（双模式）
 **Mode 1（证据充足，多平台可比）**：
