@@ -28,18 +28,29 @@ FORWARDING = {
 HANDLING_FEE = (300, 550)      # 转送手续费 JPY/件
 DEFAULT_RATE = 0.04224
 
-# 行邮税按品类分档（个人邮递物品进口税，以海关最终核定为准）
+# 行邮税按《中华人民共和国进境物品进口税税率表》（税目 1/2/3 = 13%/20%/50%）
 TARIFF_PRESETS = {
-    "digital": {"label": "数码/相机/手机/电脑/图书", "rate": 0.13},
-    "toy": {"label": "玩具/游戏品/节日用品", "rate": 0.13},
-    "apparel": {"label": "服装/鞋靴/箱包/纺织品", "rate": 0.20},
-    "care": {"label": "化妆品/洗护/香氛（普通）", "rate": 0.20},
-    "appliance": {"label": "家电/家具/体育用品", "rate": 0.20},
-    "luxury": {"label": "高档化妆品/贵重首饰", "rate": 0.50},
+    # 税目 1 — 13%
+    "it": {"label": "书报/教育影视、计算机/手机/数码相机等信息技术产品", "rate": 0.13},
+    "food": {"label": "食品/饮料/药品", "rate": 0.13},
+    "precious_metal": {"label": "金银及其制品", "rate": 0.13},
+    "furniture": {"label": "家具", "rate": 0.13},
+    "toy": {"label": "玩具/游戏品/节日或其他娱乐用品", "rate": 0.13},
+    "sports": {"label": "运动用品（不含高尔夫球及球具）/钓鱼用品", "rate": 0.13},
+    # 税目 2 — 20%
+    "textile": {"label": "纺织品及其制成品（服装/鞋帽/箱包）", "rate": 0.20},
+    "appliance": {"label": "电视摄像机及其他电器用具（家电）", "rate": 0.20},
+    "bike": {"label": "自行车", "rate": 0.20},
+    "other": {"label": "税目 1/3 未包含的其他商品（普通化妆品/洗护等）", "rate": 0.20},
+    # 税目 3 — 50%
     "tobacco_alcohol": {"label": "烟/酒", "rate": 0.50},
+    "jewelry": {"label": "贵重首饰及珠宝玉石", "rate": 0.50},
+    "golf": {"label": "高尔夫球及球具", "rate": 0.50},
+    "luxury": {"label": "高档手表/高档化妆品", "rate": 0.50},
 }
-DEFAULT_TARIFF_RATE = 0.20     # 未指定品类时的兜底税率
-TARIFF_EXEMPT_THRESHOLD = 50.0  # 应征税额 ≤50 元人民币免征（海关个人邮递物品规定）
+DEFAULT_TARIFF_RATE = 0.20     # 未指定品类时按税目 2「其他商品」兜底
+TARIFF_EXEMPT_THRESHOLD = 50.0  # 应征税额 ≤50 元人民币免征（个人邮递物品）
+POSTAL_LIMIT_CNY = 1000.0      # 个人邮递物品单次限值 1000 元（港澳台 800 元）
 
 
 def estimate(price_jpy, channel="ems", domestic_jpy=0.0, rate=None, refresh_rate=True,
@@ -218,6 +229,14 @@ def main():
                 f"申报重量 {args.weight_kg}kg 超出内置价目表适用范围（≤1.5kg 小件）："
                 "下方转运费区间仅按小件价目估算，重物（家电/家具等）请以转送JAPAN 官网实时报价为准。")
             args.caveats.append(result["weight_warning"])
+    item_cny = result["breakdown_cny"]["item"]
+    if item_cny > POSTAL_LIMIT_CNY:
+        result["postal_limit"] = {"item_cny": item_cny, "limit_cny": POSTAL_LIMIT_CNY,
+                                  "exceeded": True}
+        args.caveats.append(
+            f"商品价折合 {item_cny:,.2f} 元，超过个人邮递物品单次限值 {POSTAL_LIMIT_CNY:,.0f} 元"
+            "（港澳台 800 元）：本单不能直接按个人邮寄清关，需拆单、退运，或改走跨境电商零售进口"
+            "（单次 5000 元限额、综合税率约 9.1%）/ 按货物报关。下方行邮税仅作参考。")
     if args.quote:
         result["quote_md"] = build_quote_md(
             result, item_name=args.item_name, platform=args.platform,
