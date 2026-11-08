@@ -1,1 +1,333 @@
-{"output":"1\t# -*- coding: utf-8 -*-\n2\t\"\"\"到手价试算：商品价 + 日本国内运费 + 转运运费 + 转运手续费 + 关税，全部换算为 CNY（估算）。\n3\t\n4\t公式见 references/price_formula.md；转运价目见 references/forwarding_rates.md。\n5\t\n6\t用法：\n7\t  python3 arrival_price.py --price-jpy 16500\n8\t  python3 arrival_price.py --price-jpy 16500 --channel echina --domestic-jpy 660\n9\t  python3 arrival_price.py --price-jpy 16500 --baseline   # 用内置基准汇率，不打网络\n10\t  python3 arrival_price.py --price-jpy 33000 --quote \\\n11\t      --item-name \"ace GENE CB2 背包 20025\" --platform \"乐天 / Amazon Japan\" \\\n12\t      --condition \"全新\" --confidence \"高\" --quote-file quote.md   # 直接产出确认单\n13\t\"\"\"\n14\timport argparse\n15\timport datetime\n16\timport json\n17\t\n18\timport exchange_rate\n19\tfrom _common import JsbError\n20\t\n21\t# 转运价目（转送JAPAN 中国区，JPY；脱敏自 azone 实测，标注估算）\n22\tFORWARDING = {\n23\t    \"echina\": {\"label\": \"eCHINA\", \"range\": (1500, 2600), \"days\": \"约 1 周\", \"note\": \"最省\"},\n24\t    \"ems\": {\"label\": \"EMS\", \"range\": (2200, 2800), \"days\": \"3~7 天\", \"note\": \"最稳，保价规范\"},\n25\t    \"sf\": {\"label\": \"SF CHINA\", \"range\": (2950, 3600), \"days\": \"—\", \"note\": \"贵\"},\n26\t    \"ship\": {\"label\": \"船运\", \"range\": (1800, 2200), \"days\": \"1~2 月\", \"note\": \"慢\"},\n27\t}\n28\tHANDLING_FEE = (300, 550)      # 转送手续费 JPY/件\n29\tDEFAULT_RATE = 0.04224\n30\t\n31\t# 行邮税按《中华人民共和国进境物品进口税税率表》（税目 1/2/3 = 13%/20%/50%）\n32\tTARIFF_PRESETS = {\n33\t    # 税目 1 — 13%\n34\t    \"it\": {\"label\": \"书报/教育影视、计算机/手机/数码相机等信息技术产品\", \"rate\": 0.13},\n35\t    \"food\": {\"label\": \"食品/饮料/药品\", \"rate\": 0.13},\n36\t    \"precious_metal\": {\"label\": \"金银及其制品\", \"rate\": 0.13},\n37\t    \"furniture\": {\"label\": \"家具\", \"rate\": 0.13},\n38\t    \"toy\": {\"label\": \"玩具/游戏品/节日或其他娱乐用品\", \"rate\": 0.13},\n39\t    \"sports\": {\"label\": \"运动用品（不含高尔夫球及球具）/钓鱼用品\", \"rate\": 0.13},\n40\t    # 税目 2 — 20%\n41\t    \"textile\": {\"label\": \"纺织品及其制成品（服装/鞋帽/箱包）\", \"rate\": 0.20},\n42\t    \"appliance\": {\"label\": \"电视摄像机及其他电器用具（家电）\", \"rate\": 0.20},\n43\t    \"bike\": {\"label\": \"自行车\", \"rate\": 0.20},\n44\t    \"other\": {\"label\": \"税目 1/3 未包含的其他商品（普通化妆品/洗护等）\", \"rate\": 0.20},\n45\t    # 税目 3 — 50%\n46\t    \"tobacco_alcohol\": {\"label\": \"烟/酒\", \"rate\": 0.50},\n47\t    \"jewelry\": {\"label\": \"贵重首饰及珠宝玉石\", \"rate\": 0.50},\n48\t    \"golf\": {\"label\": \"高尔夫球及球具\", \"rate\": 0.50},\n49\t    \"luxury\": {\"label\": \"高档手表/高档化妆品\", \"rate\": 0.50},\n50\t}\n51\tDEFAULT_TARIFF_RATE = 0.20     # 未指定品类时按税目 2「其他商品」兜底\n52\tTARIFF_EXEMPT_THRESHOLD = 50.0  # 应征税额 ≤50 元人民币免征（个人邮递物品）\n53\tPOSTAL_LIMIT_CNY = 1000.0      # 个人邮递物品单次限值 1000 元（港澳台 800 元）\n54\t\n55\t# 收货地（目的地）规则：CN 完整建模；HK/其他仅给框架并声明未建模，不编数字\n56\tDESTINATIONS = {\n57\t    \"cn\": {\n58\t        \"label\": \"中国大陆\", \"tax_model\": \"personal_postal\", \"limit_cny\": POSTAL_LIMIT_CNY,\n59\t        \"basis\": \"行邮税按《中华人民共和国进境物品进口税税率表》税目 1/2/3（13%/20%/50%，2019-04-09 起）；\"\n60\t                 \"应征税额 ≤50 元免征、单次限值 1000 元（港澳台 800 元）出自《海关总署公告 2010 年第 43 号》\",\n61\t    },\n62\t    \"hk\": {\n63\t        \"label\": \"中国香港\", \"tax_model\": \"free_port\", \"limit_cny\": None,\n64\t        \"basis\": \"香港为自由港：一般商品不征进口关税与增值税（烟、酒、燃油等应课税品除外）\",\n65\t    },\n66\t    \"other\": {\n67\t        \"label\": \"其他目的地\", \"tax_model\": \"not_modeled\", \"limit_cny\": None,\n68\t        \"basis\": \"目的地进口税未建模，需按当地海关规定另计（如英国 £135、日本关税、加拿大 GST/PST 等）\",\n69\t    },\n70\t}\n71\t\n72\t\n73\tdef estimate(price_jpy, channel=\"ems\", domestic_jpy=0.0, rate=None, refresh_rate=True,\n74\t             tariff_category=None, tariff_rate=None, destination=\"cn\"):\n75\t    if price_jpy <= 0:\n76\t        raise JsbError(f\"price_jpy 必须为正数（当前 {price_jpy}）\")\n77\t    if domestic_jpy < 0:\n78\t        raise JsbError(f\"domestic_jpy 不能为负（当前 {domestic_jpy}）\")\n79\t    ch = FORWARDING.get(channel)\n80\t    if not ch:\n81\t        raise JsbError(f\"未知转运线路：{channel}（可选 {', '.join(FORWARDING)}）\")\n82\t    if destination not in DESTINATIONS:\n83\t        raise JsbError(f\"未知收货地：{destination}（可选 {', '.join(DESTINATIONS)}）\")\n84\t    if tariff_rate is not None and not 0 <= tariff_rate <= 1:\n85\t        raise JsbError(f\"tariff_rate 必须在 0~1 之间（当前 {tariff_rate}）\")\n86\t    if tariff_category and tariff_category not in TARIFF_PRESETS:\n87\t        raise JsbError(f\"未知行邮税品类：{tariff_category}\"\n88\t                       f\"（可选 {', '.join(TARIFF_PRESETS)}）\")\n89\t\n90\t    if rate is None:\n91\t        if refresh_rate:\n92\t            r = exchange_rate.fetch()  # 实时刷新，网络失败自动降级到内置基准\n93\t            rate, rate_source = r[\"rate\"], r[\"source\"]\n94\t        else:\n95\t            rate, rate_source = DEFAULT_RATE, \"builtin_baseline\"\n96\t    else:\n97\t        rate_source = \"manual\"\n98\t\n99\t    price_jpy = float(price_jpy)\n100\t    domestic_jpy = float(domestic_jpy)\n101\t    item_cny = price_jpy * rate\n102\t    domestic_cny = domestic_jpy * rate\n103\t    ship_min, ship_max = ch[\"range\"]\n104\t    ship_cny = (ship_min * rate, ship_max * rate)\n105\t    fee_cny = (HANDLING_FEE[0] * rate, HANDLING_FEE[1] * rate)\n106\t\n107\t    dest = DESTINATIONS[destination]\n108\t\n109\t    # 进口税：CN 完整建模；HK 自由港 0 税；其他目的地不建模（不编数字）\n110\t    if destination == \"cn\":\n111\t        if tariff_rate is not None:\n112\t            tr, tr_source, tr_label = float(tariff_rate), \"manual\", \"手动指定\"\n113\t        elif tariff_category:\n114\t            preset = TARIFF_PRESETS[tariff_category]\n115\t            tr, tr_source, tr_label = preset[\"rate\"], tariff_category, preset[\"label\"]\n116\t        else:\n117\t            tr, tr_source, tr_label = DEFAULT_TARIFF_RATE, \"default\", \"未指定品类（按税目2其他商品兜底）\"\n118\t        tariff_raw = item_cny * tr\n119\t        tariff_exempt = tariff_raw <= TARIFF_EXEMPT_THRESHOLD\n120\t        tariff_cny = 0.0 if tariff_exempt else tariff_raw\n121\t        tax_modeled = True\n122\t    elif destination == \"hk\":\n123\t        tr, tr_source, tr_label = 0.0, \"destination_hk\", \"香港自由港（一般商品零关税、无增值税）\"\n124\t        tariff_raw = tariff_cny = 0.0\n125\t        tariff_exempt = False\n126\t        tax_modeled = True\n127\t    else:\n128\t        tr, tr_source, tr_label = 0.0, \"destination_other\", \"目的地进口税未建模\"\n129\t        tariff_raw = tariff_cny = 0.0\n130\t        tariff_exempt = False\n131\t        tax_modeled = False\n132\t\n133\t    total_min = item_cny + domestic_cny + ship_cny[0] + fee_cny[0] + tariff_cny\n134\t    total_max = item_cny + domestic_cny + ship_cny[1] + fee_cny[1] + tariff_cny\n135\t    snapshot = datetime.datetime.now().astimezone().isoformat()\n136\t\n137\t    data_sources = [\n138\t        {\"field\": \"商品价\", \"source\": \"用户提供的平台页面/截图（模型识别，非脚本抓取）\"},\n139\t        {\"field\": \"汇率\", \"source\": f\"scripts/exchange_rate.py（source={rate_source}，快照 {snapshot}）\"},\n140\t        {\"field\": \"转运运费/手续费\", \"source\": \"references/forwarding_rates.md（转送JAPAN 中国区价目区间，估算）\"},\n141\t        {\"field\": \"商品行情\", \"source\": \"scripts/rakuten_search.py（乐天 RWS）/ scripts/amazon_jp_snapshot.py（Amazon JP 快照），\"\n142\t                                     \"仅 status=current 的报价可引用\"},\n143\t        {\"field\": \"进口税\", \"source\": (f\"{dest['basis']}；本单适用：{tr_label}\" if tax_modeled else dest[\"basis\"])},\n144\t    ]\n145\t\n146\t    return {\n147\t        \"item\": {\"price_jpy\": price_jpy, \"domestic_jpy\": domestic_jpy},\n148\t        \"channel\": {\"key\": channel, \"label\": ch[\"label\"], \"days\": ch[\"days\"],\n149\t                    \"note\": ch[\"note\"], \"jp\": list(ch[\"range\"])},\n150\t        \"destination\": {\"key\": destination, \"label\": dest[\"label\"],\n151\t                        \"tax_model\": dest[\"tax_model\"], \"tax_modeled\": tax_modeled,\n152\t                        \"limit_cny\": dest.get(\"limit_cny\"),\n153\t                        \"threshold_local\": dest.get(\"threshold_local\"),\n154\t                        \"currency\": dest.get(\"currency\"), \"basis\": dest[\"basis\"]},\n155\t        \"rate\": {\"jpy_cny\": round(rate, 6), \"source\": rate_source, \"snapshot_time\": snapshot},\n156\t        \"tariff\": {\"rate\": tr, \"source\": tr_source, \"category\": tr_label,\n157\t                   \"raw_cny\": round(tariff_raw, 2), \"exempt\": tariff_exempt,\n158\t                   \"charged_cny\": round(tariff_cny, 2),\n159\t                   \"exempt_threshold\": TARIFF_EXEMPT_THRESHOLD, \"modeled\": tax_modeled},\n160\t        \"breakdown_cny\": {\n161\t            \"item\": round(item_cny, 2),\n162\t            \"domestic\": round(domestic_cny, 2),\n163\t            \"forwarding\": (round(ship_cny[0], 2), round(ship_cny[1], 2)),\n164\t            \"handling_fee\": (round(fee_cny[0], 2), round(fee_cny[1], 2)),\n165\t            \"tariff\": round(tariff_cny, 2),\n166\t        },\n167\t        \"total_cny\": (round(total_min, 2), round(total_max, 2)),\n168\t        \"data_sources\": data_sources,\n169\t        \"estimate_note\": \"估算值：以实时汇率 / 转运价目 / 海关核定为准，成交前请刷新复查。\",\n170\t        \"provenance\": {\n171\t            \"computed_by\": \"scripts/arrival_price.py\",\n172\t            \"rate_by\": \"scripts/exchange_rate.py\",\n173\t            \"rule\": \"本结果所有金额均由脚本计算，模型不得自行推算或改写数值（provenance 约束）。\",\n174\t        },\n175\t    }\n176\t\n177\t\n178\tFIXED_CAVEATS = [\n179\t    \"成色说明为识别推断，非实际值，待核实\",\n180\t    \"二手/券后价为特定条件下价格，不等于常规价\",\n181\t    \"汇率有快照时效，成交前请刷新复查\",\n182\t    \"转运运费按实际称重浮动，本单为价目区间\",\n183\t    \"渠道覆盖有限：未覆盖的渠道可能存在更低报价\",\n184\t]\n185\t\n186\t\n187\tdef build_quote_md(res, item_name=\"\", platform=\"\", condition=\"\", confidence=\"\",\n188\t                   caveats=None, quote_type=\"purchase\"):\n189\t    \"\"\"把试算结果渲染成整张确认单 Markdown（金额全部来自脚本，模型只做转述）。\"\"\"\n190\t    b = res[\"breakdown_cny\"]\n191\t    r = res[\"rate\"]\n192\t    ch = res[\"channel\"]\n193\t    t = res[\"tariff\"]\n194\t    dest = res[\"destination\"]\n195\t    title = \"购买确认单（估算）\" if quote_type == \"purchase\" else \"支付确认单（估算）\"\n196\t    lines = [f\"# {title}\", \"\"]\n197\t\n198\t    if item_name:\n199\t        lines.append(f\"**商品**：{item_name}\")\n200\t    if platform:\n201\t        lines.append(f\"**平台/渠道**：{platform}\")\n202\t    if condition:\n203\t        lines.append(f\"**成色**：{condition}（识别推断，标注待核实）\")\n204\t    if confidence:\n205\t        lines.append(f\"**同款匹配置信度**：{confidence}\")\n206\t    lines.append(f\"**收货地**：{dest['label']}（税制模型：{dest['tax_model']}）\")\n207\t    lines.append(\"\")\n208\t\n209\t    if dest[\"key\"] == \"cn\":\n210\t        if t[\"exempt\"]:\n211\t            tax_cell = f\"{t['rate']:.0%}｜{t['category']}\"\n212\t            tax_extra = f\"（应征 {t['raw_cny']:,.2f} ≤ {t['exempt_threshold']:.0f} 元，免征）\"\n213\t        else:\n214\t            tax_cell = f\"{t['rate']:.0%}｜{t['category']}\"\n215\t            tax_extra = \"\"\n216\t        tax_label = \"行邮税\"\n217\t    elif dest[\"key\"] == \"hk\":\n218\t        tax_cell, tax_extra, tax_label = \"0%（香港自由港）\", \"\", \"进口税\"\n219\t    else:\n220\t        tax_cell, tax_extra, tax_label = \"未建模\", \"（需按目的地税法另计）\", \"进口税\"\n221\t\n222\t    lines += [\n223\t        f\"**到手价明细（估算，汇率快照 {r['snapshot_time']}，JPY→CNY {r['jpy_cny']}，来源 {r['source']}）**\",\n224\t        \"\",\n225\t        \"| 分项 | 金额（CNY） |\",\n226\t        \"|---|---|\",\n227\t        f\"| 商品价（¥{res['item']['price_jpy']:,.0f}） | {b['item']:,.2f} |\",\n228\t        f\"| 日本国内运费（¥{res['item']['domestic_jpy']:,.0f}） | {b['domestic']:,.2f} |\",\n229\t        f\"| 转运运费（{ch['label']}，{ch['days']}） | {b['forwarding'][0]:,.2f} ~ {b['forwarding'][1]:,.2f} |\",\n230\t        f\"| 转运手续费 | {b['handling_fee'][0]:,.2f} ~ {b['handling_fee'][1]:,.2f} |\",\n231\t        f\"| {tax_label}（{tax_cell}） | {b['tariff']:,.2f}{tax_extra} |\",\n232\t        f\"| **合计（估算）** | **{res['total_cny'][0]:,.2f} ~ {res['total_cny'][1]:,.2f}** |\",\n233\t        \"\",\n234\t        \"**Caveats（必读）**\",\n235\t        \"\",\n236\t    ]\n237\t    for c in FIXED_CAVEATS + list(caveats or []):\n238\t        lines.append(f\"- {c}\")\n239\t\n240\t    lines += [\n241\t        \"\",\n242\t        \"**计算依据与数据来源**\",\n243\t        \"\",\n244\t        \"| 分项 | 依据 / 来源 |\",\n245\t        \"|---|---|\",\n246\t    ]\n247\t    for s in res[\"data_sources\"]:\n248\t        lines.append(f\"| {s['field']} | {s['source']} |\")\n249\t    lines += [\n250\t        \"\",\n251\t        \"**估算声明**：以上金额由 `scripts/arrival_price.py` 计算，汇率由 `scripts/exchange_rate.py` 获取；\"\n252\t        \"模型未参与任何数值计算。以实时汇率 / 转运价目 / 海关核定为准。\",\n253\t        \"\",\n254\t        \"- [ ] 用户确认商品与金额\",\n255\t    ]\n256\t    return \"\\n\".join(lines)\n257\t\n258\t\n259\tdef main():\n260\t    ap = argparse.ArgumentParser(description=\"日淘到手价试算（估算）\")\n261\t    ap.add_argument(\"--price-jpy\", type=float, required=True, help=\"商品价（含税，日元）\")\n262\t    ap.add_argument(\"--domestic-jpy\", type=float, default=0, help=\"日本国内运费（日元，默认 0）\")\n263\t    ap.add_argument(\"--channel\", default=\"ems\", choices=list(FORWARDING))\n264\t    ap.add_argument(\"--rate\", type=float, default=None, help=\"手动指定汇率 JPY→CNY\")\n265\t    ap.add_argument(\"--baseline\", action=\"store_true\", help=\"用内置基准汇率，不打网络\")\n266\t    ap.add_argument(\"--quote\", action=\"store_true\", help=\"同时输出整张确认单（Markdown）\")\n267\t    ap.add_argument(\"--quote-file\", default=None, help=\"确认单写入的文件路径（配合 --quote）\")\n268\t    ap.add_argument(\"--quote-type\", default=\"purchase\", choices=[\"purchase\", \"payment\"],\n269\t                    help=\"purchase=购买确认单（中立版）；payment=支付确认单（PayPal 版）\")\n270\t    ap.add_argument(\"--item-name\", default=\"\", help=\"商品名（写入确认单）\")\n271\t    ap.add_argument(\"--platform\", default=\"\", help=\"平台/渠道（写入确认单）\")\n272\t    ap.add_argument(\"--condition\", default=\"\", help=\"成色（写入确认单）\")\n273\t    ap.add_argument(\"--confidence\", default=\"\", help=\"同款匹配置信度：高/中/低\")\n274\t    ap.add_argument(\"--caveats\", action=\"append\", default=[], help=\"追加 Caveats，可重复\")\n275\t    ap.add_argument(\"--weight-kg\", type=float, default=None,\n276\t                    help=\"申报重量（kg）。内置价目表仅覆盖 ≤1.5kg 小件，超重会给出警告\")\n277\t    ap.add_argument(\"--tariff-category\", default=None, choices=list(TARIFF_PRESETS),\n278\t                    help=\"按官方税目取税率（it/toy/furniture/sports/food/precious_metal=13%%，\"\n279\t                         \"textile/appliance/bike/other=20%%，luxury/jewelry/golf/tobacco_alcohol=50%%）\")\n280\t    ap.add_argument(\"--tariff-rate\", type=float, default=None,\n281\t                    help=\"手动指定行邮税率（0~1，覆盖品类预设；仅 --destination cn 生效）\")\n282\t    ap.add_argument(\"--destination\", default=\"cn\", choices=list(DESTINATIONS),\n283\t                    help=\"收货地：cn=中国大陆（完整行邮税建模）/ hk=香港自由港 / other=其他目的地（税未建模）\")\n284\t    args = ap.parse_args()\n285\t\n286\t    try:\n287\t        result = estimate(args.price_jpy, channel=args.channel,\n288\t                          domestic_jpy=args.domestic_jpy, rate=args.rate,\n289\t                          refresh_rate=not args.baseline,\n290\t                          tariff_category=args.tariff_category,\n291\t                          tariff_rate=args.tariff_rate,\n292\t                          destination=args.destination)\n293\t    except JsbError as e:\n294\t        print(json.dumps({\"status\": \"error\", \"code\": \"BAD_INPUT\", \"error\": str(e)},\n295\t                         ensure_ascii=False, indent=2))\n296\t        raise SystemExit(1)\n297\t\n298\t    result[\"status\"] = \"current\"\n299\t    if args.weight_kg is not None:\n300\t        result[\"weight_kg\"] = args.weight_kg\n301\t        if args.weight_kg > 1.5:\n302\t            result[\"weight_warning\"] = (\n303\t                f\"申报重量 {args.weight_kg}kg 超出内置价目表适用范围（≤1.5kg 小件）：\"\n304\t                \"下方转运费区间仅按小件价目估算，重物（家电/家具等）请以转送JAPAN 官网实时报价为准。\")\n305\t            args.caveats.append(result[\"weight_warning\"])\n306\t    item_cny = result[\"breakdown_cny\"][\"item\"]\n307\t    if args.destination == \"cn\" and item_cny > POSTAL_LIMIT_CNY:\n308\t        result[\"postal_limit\"] = {\"item_cny\": item_cny, \"limit_cny\": POSTAL_LIMIT_CNY,\n309\t                                  \"exceeded\": True}\n310\t        args.caveats.append(\n311\t            f\"商品价折合 {item_cny:,.2f} 元，超过个人邮递物品单次限值 {POSTAL_LIMIT_CNY:,.0f} 元\"\n312\t            \"（港澳台 800 元）：本单不能直接按个人邮寄清关，需拆单、退运，或改走跨境电商零售进口\"\n313\t            \"（单次 5000 元限额、综合税率约 9.1%）/ 按货物报关。下方行邮税仅作参考。\")\n314\t    if args.destination != \"cn\":\n315\t        args.caveats.append(\n316\t            \"转运价目取自转送JAPAN 中国区价目，其他目的地的可用线路与运费可能不同；\"\n317\t            \"进口税未建模的，请按收货地海关规定另计。\")\n318\t    if args.quote:\n319\t        result[\"quote_md\"] = build_quote_md(\n320\t            result, item_name=args.item_name, platform=args.platform,\n321\t            condition=args.condition, confidence=args.confidence,\n322\t            caveats=args.caveats, quote_type=args.quote_type,\n323\t        )\n324\t        if args.quote_file:\n325\t            with open(args.quote_file, \"w\", encoding=\"utf-8\") as f:\n326\t                f.write(result[\"quote_md\"])\n327\t            result[\"quote_file\"] = args.quote_file\n328\t\n329\t    print(json.dumps(result, ensure_ascii=False, indent=2))\n330\t\n331\t\n332\tif __name__ == \"__main__\":\n333\t    main()"}
+# -*- coding: utf-8 -*-
+"""到手价试算：商品价 + 日本国内运费 + 转运运费 + 转运手续费 + 关税，全部换算为 CNY（估算）。
+
+公式见 references/price_formula.md；转运价目见 references/forwarding_rates.md。
+
+用法：
+  python3 arrival_price.py --price-jpy 16500
+  python3 arrival_price.py --price-jpy 16500 --channel echina --domestic-jpy 660
+  python3 arrival_price.py --price-jpy 16500 --baseline   # 用内置基准汇率，不打网络
+  python3 arrival_price.py --price-jpy 33000 --quote \
+      --item-name "ace GENE CB2 背包 20025" --platform "乐天 / Amazon Japan" \
+      --condition "全新" --confidence "高" --quote-file quote.md   # 直接产出确认单
+"""
+import argparse
+import datetime
+import json
+
+import exchange_rate
+from _common import JsbError
+
+# 转运价目（转送JAPAN 中国区，JPY；脱敏自 azone 实测，标注估算）
+FORWARDING = {
+    "echina": {"label": "eCHINA", "range": (1500, 2600), "days": "约 1 周", "note": "最省"},
+    "ems": {"label": "EMS", "range": (2200, 2800), "days": "3~7 天", "note": "最稳，保价规范"},
+    "sf": {"label": "SF CHINA", "range": (2950, 3600), "days": "—", "note": "贵"},
+    "ship": {"label": "船运", "range": (1800, 2200), "days": "1~2 月", "note": "慢"},
+}
+HANDLING_FEE = (300, 550)      # 转送手续费 JPY/件
+DEFAULT_RATE = 0.04224
+
+# 行邮税按《中华人民共和国进境物品进口税税率表》（税目 1/2/3 = 13%/20%/50%）
+TARIFF_PRESETS = {
+    # 税目 1 — 13%
+    "it": {"label": "书报/教育影视、计算机/手机/数码相机等信息技术产品", "rate": 0.13},
+    "food": {"label": "食品/饮料/药品", "rate": 0.13},
+    "precious_metal": {"label": "金银及其制品", "rate": 0.13},
+    "furniture": {"label": "家具", "rate": 0.13},
+    "toy": {"label": "玩具/游戏品/节日或其他娱乐用品", "rate": 0.13},
+    "sports": {"label": "运动用品（不含高尔夫球及球具）/钓鱼用品", "rate": 0.13},
+    # 税目 2 — 20%
+    "textile": {"label": "纺织品及其制成品（服装/鞋帽/箱包）", "rate": 0.20},
+    "appliance": {"label": "电视摄像机及其他电器用具（家电）", "rate": 0.20},
+    "bike": {"label": "自行车", "rate": 0.20},
+    "other": {"label": "税目 1/3 未包含的其他商品（普通化妆品/洗护等）", "rate": 0.20},
+    # 税目 3 — 50%
+    "tobacco_alcohol": {"label": "烟/酒", "rate": 0.50},
+    "jewelry": {"label": "贵重首饰及珠宝玉石", "rate": 0.50},
+    "golf": {"label": "高尔夫球及球具", "rate": 0.50},
+    "luxury": {"label": "高档手表/高档化妆品", "rate": 0.50},
+}
+DEFAULT_TARIFF_RATE = 0.20     # 未指定品类时按税目 2「其他商品」兜底
+TARIFF_EXEMPT_THRESHOLD = 50.0  # 应征税额 ≤50 元人民币免征（个人邮递物品）
+POSTAL_LIMIT_CNY = 1000.0      # 个人邮递物品单次限值 1000 元（港澳台 800 元）
+
+# 收货地（目的地）规则：CN 完整建模；HK/其他仅给框架并声明未建模，不编数字
+DESTINATIONS = {
+    "cn": {
+        "label": "中国大陆", "tax_model": "personal_postal", "limit_cny": POSTAL_LIMIT_CNY,
+        "basis": "行邮税按《中华人民共和国进境物品进口税税率表》税目 1/2/3（13%/20%/50%，2019-04-09 起）；"
+                 "应征税额 ≤50 元免征、单次限值 1000 元（港澳台 800 元）出自《海关总署公告 2010 年第 43 号》",
+    },
+    "hk": {
+        "label": "中国香港", "tax_model": "free_port", "limit_cny": None,
+        "basis": "香港为自由港：一般商品不征进口关税与增值税（烟、酒、燃油等应课税品除外）",
+    },
+    "other": {
+        "label": "其他目的地", "tax_model": "not_modeled", "limit_cny": None,
+        "basis": "目的地进口税未建模，需按当地海关规定另计（如英国 £135、日本关税、加拿大 GST/PST 等）",
+    },
+}
+
+
+def estimate(price_jpy, channel="ems", domestic_jpy=0.0, rate=None, refresh_rate=True,
+             tariff_category=None, tariff_rate=None, destination="cn"):
+    if price_jpy <= 0:
+        raise JsbError(f"price_jpy 必须为正数（当前 {price_jpy}）")
+    if domestic_jpy < 0:
+        raise JsbError(f"domestic_jpy 不能为负（当前 {domestic_jpy}）")
+    ch = FORWARDING.get(channel)
+    if not ch:
+        raise JsbError(f"未知转运线路：{channel}（可选 {', '.join(FORWARDING)}）")
+    if destination not in DESTINATIONS:
+        raise JsbError(f"未知收货地：{destination}（可选 {', '.join(DESTINATIONS)}）")
+    if tariff_rate is not None and not 0 <= tariff_rate <= 1:
+        raise JsbError(f"tariff_rate 必须在 0~1 之间（当前 {tariff_rate}）")
+    if tariff_category and tariff_category not in TARIFF_PRESETS:
+        raise JsbError(f"未知行邮税品类：{tariff_category}"
+                       f"（可选 {', '.join(TARIFF_PRESETS)}）")
+
+    if rate is None:
+        if refresh_rate:
+            r = exchange_rate.fetch()  # 实时刷新，网络失败自动降级到内置基准
+            rate, rate_source = r["rate"], r["source"]
+        else:
+            rate, rate_source = DEFAULT_RATE, "builtin_baseline"
+    else:
+        rate_source = "manual"
+
+    price_jpy = float(price_jpy)
+    domestic_jpy = float(domestic_jpy)
+    item_cny = price_jpy * rate
+    domestic_cny = domestic_jpy * rate
+    ship_min, ship_max = ch["range"]
+    ship_cny = (ship_min * rate, ship_max * rate)
+    fee_cny = (HANDLING_FEE[0] * rate, HANDLING_FEE[1] * rate)
+
+    dest = DESTINATIONS[destination]
+
+    # 进口税：CN 完整建模；HK 自由港 0 税；其他目的地不建模（不编数字）
+    if destination == "cn":
+        if tariff_rate is not None:
+            tr, tr_source, tr_label = float(tariff_rate), "manual", "手动指定"
+        elif tariff_category:
+            preset = TARIFF_PRESETS[tariff_category]
+            tr, tr_source, tr_label = preset["rate"], tariff_category, preset["label"]
+        else:
+            tr, tr_source, tr_label = DEFAULT_TARIFF_RATE, "default", "未指定品类（按税目2其他商品兜底）"
+        tariff_raw = item_cny * tr
+        tariff_exempt = tariff_raw <= TARIFF_EXEMPT_THRESHOLD
+        tariff_cny = 0.0 if tariff_exempt else tariff_raw
+        tax_modeled = True
+    elif destination == "hk":
+        tr, tr_source, tr_label = 0.0, "destination_hk", "香港自由港（一般商品零关税、无增值税）"
+        tariff_raw = tariff_cny = 0.0
+        tariff_exempt = False
+        tax_modeled = True
+    else:
+        tr, tr_source, tr_label = 0.0, "destination_other", "目的地进口税未建模"
+        tariff_raw = tariff_cny = 0.0
+        tariff_exempt = False
+        tax_modeled = False
+
+    total_min = item_cny + domestic_cny + ship_cny[0] + fee_cny[0] + tariff_cny
+    total_max = item_cny + domestic_cny + ship_cny[1] + fee_cny[1] + tariff_cny
+    snapshot = datetime.datetime.now().astimezone().isoformat()
+
+    data_sources = [
+        {"field": "商品价", "source": "用户提供的平台页面/截图（模型识别，非脚本抓取）"},
+        {"field": "汇率", "source": f"scripts/exchange_rate.py（source={rate_source}，快照 {snapshot}）"},
+        {"field": "转运运费/手续费", "source": "references/forwarding_rates.md（转送JAPAN 中国区价目区间，估算）"},
+        {"field": "商品行情", "source": "scripts/rakuten_search.py（乐天 RWS）/ scripts/amazon_jp_snapshot.py（Amazon JP 快照），"
+                                     "仅 status=current 的报价可引用"},
+        {"field": "进口税", "source": (f"{dest['basis']}；本单适用：{tr_label}" if tax_modeled else dest["basis"])},
+    ]
+
+    return {
+        "item": {"price_jpy": price_jpy, "domestic_jpy": domestic_jpy},
+        "channel": {"key": channel, "label": ch["label"], "days": ch["days"],
+                    "note": ch["note"], "jp": list(ch["range"])},
+        "destination": {"key": destination, "label": dest["label"],
+                        "tax_model": dest["tax_model"], "tax_modeled": tax_modeled,
+                        "limit_cny": dest.get("limit_cny"),
+                        "threshold_local": dest.get("threshold_local"),
+                        "currency": dest.get("currency"), "basis": dest["basis"]},
+        "rate": {"jpy_cny": round(rate, 6), "source": rate_source, "snapshot_time": snapshot},
+        "tariff": {"rate": tr, "source": tr_source, "category": tr_label,
+                   "raw_cny": round(tariff_raw, 2), "exempt": tariff_exempt,
+                   "charged_cny": round(tariff_cny, 2),
+                   "exempt_threshold": TARIFF_EXEMPT_THRESHOLD, "modeled": tax_modeled},
+        "breakdown_cny": {
+            "item": round(item_cny, 2),
+            "domestic": round(domestic_cny, 2),
+            "forwarding": (round(ship_cny[0], 2), round(ship_cny[1], 2)),
+            "handling_fee": (round(fee_cny[0], 2), round(fee_cny[1], 2)),
+            "tariff": round(tariff_cny, 2),
+        },
+        "total_cny": (round(total_min, 2), round(total_max, 2)),
+        "data_sources": data_sources,
+        "estimate_note": "估算值：以实时汇率 / 转运价目 / 海关核定为准，成交前请刷新复查。",
+        "provenance": {
+            "computed_by": "scripts/arrival_price.py",
+            "rate_by": "scripts/exchange_rate.py",
+            "rule": "本结果所有金额均由脚本计算，模型不得自行推算或改写数值（provenance 约束）。",
+        },
+    }
+
+
+FIXED_CAVEATS = [
+    "成色说明为识别推断，非实际值，待核实",
+    "二手/券后价为特定条件下价格，不等于常规价",
+    "汇率有快照时效，成交前请刷新复查",
+    "转运运费按实际称重浮动，本单为价目区间",
+    "渠道覆盖有限：未覆盖的渠道可能存在更低报价",
+]
+
+
+def build_quote_md(res, item_name="", platform="", condition="", confidence="",
+                   caveats=None, quote_type="purchase"):
+    """把试算结果渲染成整张确认单 Markdown（金额全部来自脚本，模型只做转述）。"""
+    b = res["breakdown_cny"]
+    r = res["rate"]
+    ch = res["channel"]
+    t = res["tariff"]
+    dest = res["destination"]
+    title = "购买确认单（估算）" if quote_type == "purchase" else "支付确认单（估算）"
+    lines = [f"# {title}", ""]
+
+    if item_name:
+        lines.append(f"**商品**：{item_name}")
+    if platform:
+        lines.append(f"**平台/渠道**：{platform}")
+    if condition:
+        lines.append(f"**成色**：{condition}（识别推断，标注待核实）")
+    if confidence:
+        lines.append(f"**同款匹配置信度**：{confidence}")
+    lines.append(f"**收货地**：{dest['label']}（税制模型：{dest['tax_model']}）")
+    lines.append("")
+
+    if dest["key"] == "cn":
+        if t["exempt"]:
+            tax_cell = f"{t['rate']:.0%}｜{t['category']}"
+            tax_extra = f"（应征 {t['raw_cny']:,.2f} ≤ {t['exempt_threshold']:.0f} 元，免征）"
+        else:
+            tax_cell = f"{t['rate']:.0%}｜{t['category']}"
+            tax_extra = ""
+        tax_label = "行邮税"
+    elif dest["key"] == "hk":
+        tax_cell, tax_extra, tax_label = "0%（香港自由港）", "", "进口税"
+    else:
+        tax_cell, tax_extra, tax_label = "未建模", "（需按目的地税法另计）", "进口税"
+
+    lines += [
+        f"**到手价明细（估算，汇率快照 {r['snapshot_time']}，JPY→CNY {r['jpy_cny']}，来源 {r['source']}）**",
+        "",
+        "| 分项 | 金额（CNY） |",
+        "|---|---|",
+        f"| 商品价（¥{res['item']['price_jpy']:,.0f}） | {b['item']:,.2f} |",
+        f"| 日本国内运费（¥{res['item']['domestic_jpy']:,.0f}） | {b['domestic']:,.2f} |",
+        f"| 转运运费（{ch['label']}，{ch['days']}） | {b['forwarding'][0]:,.2f} ~ {b['forwarding'][1]:,.2f} |",
+        f"| 转运手续费 | {b['handling_fee'][0]:,.2f} ~ {b['handling_fee'][1]:,.2f} |",
+        f"| {tax_label}（{tax_cell}） | {b['tariff']:,.2f}{tax_extra} |",
+        f"| **合计（估算）** | **{res['total_cny'][0]:,.2f} ~ {res['total_cny'][1]:,.2f}** |",
+        "",
+        "**Caveats（必读）**",
+        "",
+    ]
+    for c in FIXED_CAVEATS + list(caveats or []):
+        lines.append(f"- {c}")
+
+    lines += [
+        "",
+        "**计算依据与数据来源**",
+        "",
+        "| 分项 | 依据 / 来源 |",
+        "|---|---|",
+    ]
+    for s in res["data_sources"]:
+        lines.append(f"| {s['field']} | {s['source']} |")
+    lines += [
+        "",
+        "**估算声明**：以上金额由 `scripts/arrival_price.py` 计算，汇率由 `scripts/exchange_rate.py` 获取；"
+        "模型未参与任何数值计算。以实时汇率 / 转运价目 / 海关核定为准。",
+        "",
+        "- [ ] 用户确认商品与金额",
+    ]
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="日淘到手价试算（估算）")
+    ap.add_argument("--price-jpy", type=float, required=True, help="商品价（含税，日元）")
+    ap.add_argument("--domestic-jpy", type=float, default=0, help="日本国内运费（日元，默认 0）")
+    ap.add_argument("--channel", default="ems", choices=list(FORWARDING))
+    ap.add_argument("--rate", type=float, default=None, help="手动指定汇率 JPY→CNY")
+    ap.add_argument("--baseline", action="store_true", help="用内置基准汇率，不打网络")
+    ap.add_argument("--quote", action="store_true", help="同时输出整张确认单（Markdown）")
+    ap.add_argument("--quote-file", default=None, help="确认单写入的文件路径（配合 --quote）")
+    ap.add_argument("--quote-type", default="purchase", choices=["purchase", "payment"],
+                    help="purchase=购买确认单（中立版）；payment=支付确认单（PayPal 版）")
+    ap.add_argument("--item-name", default="", help="商品名（写入确认单）")
+    ap.add_argument("--platform", default="", help="平台/渠道（写入确认单）")
+    ap.add_argument("--condition", default="", help="成色（写入确认单）")
+    ap.add_argument("--confidence", default="", help="同款匹配置信度：高/中/低")
+    ap.add_argument("--caveats", action="append", default=[], help="追加 Caveats，可重复")
+    ap.add_argument("--weight-kg", type=float, default=None,
+                    help="申报重量（kg）。内置价目表仅覆盖 ≤1.5kg 小件，超重会给出警告")
+    ap.add_argument("--tariff-category", default=None, choices=list(TARIFF_PRESETS),
+                    help="按官方税目取税率（it/toy/furniture/sports/food/precious_metal=13%%，"
+                         "textile/appliance/bike/other=20%%，luxury/jewelry/golf/tobacco_alcohol=50%%）")
+    ap.add_argument("--tariff-rate", type=float, default=None,
+                    help="手动指定行邮税率（0~1，覆盖品类预设；仅 --destination cn 生效）")
+    ap.add_argument("--destination", default="cn", choices=list(DESTINATIONS),
+                    help="收货地：cn=中国大陆（完整行邮税建模）/ hk=香港自由港 / other=其他目的地（税未建模）")
+    args = ap.parse_args()
+
+    try:
+        result = estimate(args.price_jpy, channel=args.channel,
+                          domestic_jpy=args.domestic_jpy, rate=args.rate,
+                          refresh_rate=not args.baseline,
+                          tariff_category=args.tariff_category,
+                          tariff_rate=args.tariff_rate,
+                          destination=args.destination)
+    except JsbError as e:
+        print(json.dumps({"status": "error", "code": "BAD_INPUT", "error": str(e)},
+                         ensure_ascii=False, indent=2))
+        raise SystemExit(1)
+
+    result["status"] = "current"
+    if args.weight_kg is not None:
+        result["weight_kg"] = args.weight_kg
+        if args.weight_kg > 1.5:
+            result["weight_warning"] = (
+                f"申报重量 {args.weight_kg}kg 超出内置价目表适用范围（≤1.5kg 小件）："
+                "下方转运费区间仅按小件价目估算，重物（家电/家具等）请以转送JAPAN 官网实时报价为准。")
+            args.caveats.append(result["weight_warning"])
+    item_cny = result["breakdown_cny"]["item"]
+    if args.destination == "cn" and item_cny > POSTAL_LIMIT_CNY:
+        result["postal_limit"] = {"item_cny": item_cny, "limit_cny": POSTAL_LIMIT_CNY,
+                                  "exceeded": True}
+        args.caveats.append(
+            f"商品价折合 {item_cny:,.2f} 元，超过个人邮递物品单次限值 {POSTAL_LIMIT_CNY:,.0f} 元"
+            "（港澳台 800 元）：本单不能直接按个人邮寄清关，需拆单、退运，或改走跨境电商零售进口"
+            "（单次 5000 元限额、综合税率约 9.1%）/ 按货物报关。下方行邮税仅作参考。")
+    if args.destination != "cn":
+        args.caveats.append(
+            "转运价目取自转送JAPAN 中国区价目，其他目的地的可用线路与运费可能不同；"
+            "进口税未建模的，请按收货地海关规定另计。")
+    if args.quote:
+        result["quote_md"] = build_quote_md(
+            result, item_name=args.item_name, platform=args.platform,
+            condition=args.condition, confidence=args.confidence,
+            caveats=args.caveats, quote_type=args.quote_type,
+        )
+        if args.quote_file:
+            with open(args.quote_file, "w", encoding="utf-8") as f:
+                f.write(result["quote_md"])
+            result["quote_file"] = args.quote_file
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
