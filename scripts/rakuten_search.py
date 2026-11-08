@@ -39,8 +39,10 @@ def _brief(text, limit=200):
     return " ".join((text or "").split())[:limit]
 
 
-def _fallback(keyword, reason):
+def _fallback(keyword, reason, code="RESULT_UNKNOWN"):
     return {
+        "status": "unavailable",   # 降级：数据不可用 ≠ 查无此商品
+        "code": code,
         "count": None,
         "hits": None,
         "keyword": keyword,
@@ -56,7 +58,7 @@ def search(keyword, hits=5, no_proxy=False, secrets=None):
     app_id = secrets.get("RAKUTEN_APPLICATION_ID")
     access_key = secrets.get("RAKUTEN_ACCESS_KEY")
     if not app_id or not access_key:
-        return _fallback(keyword, "缺少乐天凭证 RAKUTEN_APPLICATION_ID / RAKUTEN_ACCESS_KEY")
+        return _fallback(keyword, "缺少乐天凭证 RAKUTEN_APPLICATION_ID / RAKUTEN_ACCESS_KEY", "AUTH_MISSING")
 
     params = urllib.parse.urlencode({
         "format": "json",
@@ -70,18 +72,18 @@ def search(keyword, hits=5, no_proxy=False, secrets=None):
     try:
         status, text = http_request("GET", url, use_proxy=not no_proxy, timeout=15)
     except JsbError as e:
-        return _fallback(keyword, f"网络不可达：{e}")
+        return _fallback(keyword, f"网络不可达：{e}", "NET_UNREACHABLE")
 
     if status != 200:
-        return _fallback(keyword, f"HTTP {status}: {_brief(text)}")
+        return _fallback(keyword, f"HTTP {status}: {_brief(text)}", "HTTP_ERROR")
 
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return _fallback(keyword, "响应非 JSON")
+        return _fallback(keyword, "响应非 JSON", "BAD_JSON")
 
     if "errorMessage" in data or "error" in data or "Items" not in data:
-        return _fallback(keyword, _brief(text, 200))
+        return _fallback(keyword, _brief(text, 200), "API_ERROR")
 
     items = []
     for wrapper in data.get("Items", []):
@@ -96,6 +98,8 @@ def search(keyword, hits=5, no_proxy=False, secrets=None):
             "is_mock": False,
         })
     return {
+        "status": "current" if items else "empty",   # empty = API 正常但零结果（确实查无此商品）
+        "code": None,
         "count": data.get("count"),
         "hits": hits,
         "keyword": keyword,

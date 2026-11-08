@@ -6,7 +6,7 @@ description: >-
   试算真实到手价（商品+日国内运费+转运+汇率+关税），并生成购买确认单
   （明细+总额，供用户自行到原平台/代拍商完成购买，Skill 不代收代付）。
   触发：用户说「帮我看看这个日本货到手多少钱」「日淘比价」「海淘下单」，或丢来日本商品链接/截图时。
-  不触发：非日本商品、纯国内购物、与商品/比价/支付无关的提问。
+  不触发：非日本商品、纯国内购物、与商品/比价/支付无关的提问；用户已明确在国内平台买、只需国内比价时也不触发（负向边界，避免抢其他比价工具的活）。
 ---
 
 # Japan Shopping Buddy（日淘搭子）
@@ -17,9 +17,9 @@ description: >-
 ## 指令（按顺序执行，Pipeline 模式）
 1. **识别**：解析链接/截图，译出商品名、成色、价格、瑕疵描述与平台来源。若价格非日元（如 Amazon 按收货地自动显示 HKD/SGD），先反推日元原价；信息不足或收货地不明时先追问（收货地决定直邮 vs 转运与税差，必须问清）。
 2. **路由**：按「渠道路由决策树」（见 references/channel_routing.md）判断最优渠道。
-3. **比价**：优先调一手 API（乐天 RWS，脚本 scripts/rakuten_search.py）查同款/近似款行情；Amazon 走页面快照兜底（curl 走代理 + 浏览器 UA + `/-/en/` 英文路径可突破反爬，解析标题与主购买价）；Yahoo 因注册门槛放弃，降级为代拍中转 / 页面快照兜底；二手/中古源（Mercari / 雅虎拍卖 / 骏河屋）走代拍中转或降级为预置参考价、链接文字识别（见 references/fallback_cache.md）。
+3. **比价**：先判断入口类型（**单品页 / 搜索结果页 / 榜单页**三种入口解析路径不同：单品页取主购买价、搜索页取列表价与包邮信息、榜单页取排名与样本价，见 references/channel_routing.md），再按渠道查价：优先调一手 API（乐天 RWS，脚本 scripts/rakuten_search.py）查同款/近似款行情；Amazon 走页面快照兜底（curl 走代理 + 浏览器 UA + `/-/en/` 英文路径可突破反爬，解析标题与主购买价）；Yahoo 因注册门槛放弃，降级为代拍中转 / 页面快照兜底；二手/中古源（Mercari / 雅虎拍卖 / 骏河屋）走代拍中转或降级为预置参考价、链接文字识别（见 references/fallback_cache.md）。**必须读取脚本返回的 `status`**：`current`=实时数据可引用；`empty`=API 正常但确实查无此款（可下"无同款"结论）；`unavailable`=降级/失败（严禁表述为"没货/查无此商品"，只能说明数据暂不可用）。
 4. **试算**：用到手价公式（references/price_formula.md）+ 转运价目（references/forwarding_rates.md），脚本 scripts/arrival_price.py 汇总，标注估算口径 + 汇率快照时间戳。
-5. **确认单**：按 assets/confirmation_template.md 生成含明细+总额的购买确认单，交用户确认（Reviewer 卡点）。
+5. **确认单（脚本生成，模型只转述）**：`python3 arrival_price.py --price-jpy N --channel echina --quote --quote-file quote.md --item-name "…" --platform "…" --condition "…" --confidence "高/中/低"` 直接产出整张购买确认单（明细+Caveats+估算声明），交用户确认（Reviewer 卡点）。**模型不得自行填写或改写任何金额**，只负责转述脚本产出的 quote.md 内容。
 6. **购买指引**：用户确认后，给出原平台购买链接 / 代拍商下单指引，由用户自行完成购买；Skill 全程不代收代付、不自动下单。
 
 ## 确定性脚本（Tool Wrapper，凭证不入代码）
@@ -29,7 +29,37 @@ description: >-
 |---|---|---|
 | scripts/rakuten_search.py | 乐天 RWS 商品搜索/比价（默认走本机代理 127.0.0.1:7890） | `RAKUTEN_APPLICATION_ID=.. RAKUTEN_ACCESS_KEY=.. python3 rakuten_search.py "フィギュア" --hits 5` |
 | scripts/exchange_rate.py | JPY→CNY 汇率（双源 + 缓存 + 兜底） | `python3 exchange_rate.py` |
-| scripts/arrival_price.py | 到手价试算（商品+转运+手续费+关税） | `python3 arrival_price.py --price-jpy 16500 --channel ems` |
+| scripts/arrival_price.py | 到手价试算（商品+转运+手续费+关税），可 `--quote` 直接产出确认单 | `python3 arrival_price.py --price-jpy 16500 --channel ems --quote --quote-file quote.md` |
+
+## 数据可信度契约（provenance 硬约束）
+
+以下三条是**硬约束**，不是建议：
+
+1. **数值只能来自脚本**：商品价、汇率、转运费、手续费、行邮税、合计——全部必须来自 `rakuten_search.py` / `exchange_rate.py` / `arrival_price.py` 的结构化输出。模型**不得**自行心算、估算、口算或改写任何数值；缺数据就说明缺数据，不得补造。
+2. **商品标识只能来自本会话工具结果**：引用某条报价时必须带上脚本返回的 `itemCode`（乐天）或 ASIN（Amazon）；不得凭记忆或"看起来像"编造商品 ID / 链接。
+3. **状态驱动表述**：先读 `status` 再决定说什么——
+
+| status | 含义 | 允许的表述 | 禁止的表述 |
+|---|---|---|---|
+| `current` | 实时数据 | 正常比价结论 | — |
+| `empty` | API 正常、确实零结果 | "该平台未见此款" + 匹配置信度低 | "没货了/停产" |
+| `unavailable` | 网络/凭证/接口降级 | "数据暂不可用，以下为历史基准（非实时）" | "查无此商品/没有这个货" |
+| `error` | 输入参数错误 | 说明哪个参数不对 | 展示堆栈或静默返回 |
+
+**错误码枚举**（用于机器判断，不直接展示给用户）：`AUTH_MISSING`（缺凭证）、`NET_UNREACHABLE`（网络/代理不可达）、`HTTP_ERROR`（非 200）、`BAD_JSON`（响应非 JSON）、`API_ERROR`（接口返回错误体）、`RESULT_UNKNOWN`（未知降级）、`BAD_INPUT`（参数错误）。
+
+## 执行进度清单（多步链路可视化）
+
+执行时按下表逐项推进，每完成一步再进下一步；向用户汇报时可用 ✅/⬜ 展示进度：
+
+```
+⬜ 1 识别   商品名/成色/日元原价/收货地
+⬜ 2 路由   渠道决策（直邮 / 转运 / 代拍）
+⬜ 3 比价   乐天 RWS + Amazon 快照，标注 status 与置信度
+⬜ 4 试算   到手价分项 + 汇率快照时间
+⬜ 5 确认单 脚本产出 quote.md（Reviewer 卡点，等用户确认）
+⬜ 6 购买   给链接/代拍指引，用户自行成交（Skill 不代收代付）
+```
 
 ## Gotchas（避坑指南）
 - 商品信息不完整（缺成色/尺寸/平台）→ 先追问补全再试算（Inversion：宁缺毋滥，不瞎猜）。
@@ -67,6 +97,10 @@ description: >-
 3. **Caveats 防坑清单**：成色待核实 / 二手与券后价陷阱 / 汇率时效 / 转运按称重浮动 / 渠道覆盖范围，固定区块逐单提醒。
 4. **收货地第一变量**：非日元显示先反推日元原价（Amazon 按收货地自动换算 HKD/SGD），比价前必问收货地——直邮 vs 转运税差实测可达 ¥400。
 5. **全链路估算纪律**：汇率带快照时间戳，到手价只给区间不给假精确，分项透明可复核。
+6. **Provenance 硬约束（防幻觉报价）**：所有金额只能来自脚本结构化输出，确认单由 `arrival_price.py --quote` 直接渲染，模型只转述不填数——把"别乱算"从文案约束升级为结构约束（参照 Anthropic 官方 commerce-agents 的 provenance 设计）。
+7. **状态三态，不把失败说成没货**：`current` / `empty` / `unavailable` 三态 + 错误码枚举（`AUTH_MISSING` / `NET_UNREACHABLE` / `HTTP_ERROR` / `BAD_JSON` / `API_ERROR`），降级时只说"数据暂不可用"，绝不说"查无此商品"。
+8. **入口分流 + 进度可视化**：单品页/搜索页/榜单页三种入口走不同解析路径；六步进度清单（⬜1识别→⬜6购买）让多步链路对评委可见。
+9. **负向边界清晰**：SKILL.md 明确写"用户已明确在国内平台买、只需国内比价时不触发"，不抢其他比价工具的活（参照官方的负向触发描述写法）。
 
 ## 比价输出纪律（双模式）
 **Mode 1（证据充足，多平台可比）**：
