@@ -37,7 +37,7 @@
 ## 目录
 
 - `SKILL.md` — Agent 指令（六步 SOP + 设计亮点 + 双模式输出纪律 + Gotchas + 禁止行为）
-- `scripts/` — `rakuten_search.py`（乐天 RWS）、`exchange_rate.py`（汇率双源+缓存）、`arrival_price.py`（到手价试算）
+- `scripts/` — `rakuten_search.py`（乐天 RWS）、`exchange_rate.py`（汇率双源+缓存）、`arrival_price.py`（到手价试算）、`smoke_test.py`（冒烟回归，`python3 scripts/smoke_test.py` 可一键复测 35 项脚本契约）
 - `references/` — 渠道路由 / 到手价公式 / 转运价目 / 离线兜底快照
 - `assets/` — 购买确认单模板（Generator）+ 图标
 
