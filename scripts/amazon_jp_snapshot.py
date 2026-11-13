@@ -17,7 +17,7 @@ import argparse
 import json
 import re
 
-from _common import JsbError, http_request
+from _common import JsbError, http_request, proxy_enabled
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
@@ -93,11 +93,12 @@ def parse_item(html, asin):
 
 def snapshot(asin, no_proxy=False):
     url = f"https://www.amazon.co.jp/-/en/dp/{asin}/"
+    use_proxy = proxy_enabled() and not no_proxy
     try:
-        status, html = http_request("GET", url, headers=HEADERS, use_proxy=not no_proxy, timeout=25)
+        status, html = http_request("GET", url, headers=HEADERS, use_proxy=use_proxy, timeout=25)
     except JsbError as e:
         return {"status": "unavailable", "code": "NET_UNREACHABLE", "asin": asin,
-                "reason": str(e), "hint": "检查本机代理 127.0.0.1:7890 是否可用"}
+                "reason": str(e), "hint": "本机需 JSB_PROXY=1 启用代理；云端服务器默认直连即可"}
 
     if status != 200:
         return {"status": "unavailable", "code": "HTTP_ERROR", "asin": asin,
@@ -123,8 +124,9 @@ def snapshot(asin, no_proxy=False):
 def bestsellers(category="toys", limit=5, no_proxy=False):
     """从日亚畅销榜抓若干 ASIN，用于随机抽样测试。"""
     url = f"https://www.amazon.co.jp/-/en/gp/bestsellers/{category}/"
+    use_proxy = proxy_enabled() and not no_proxy
     try:
-        status, html = http_request("GET", url, headers=HEADERS, use_proxy=not no_proxy, timeout=25)
+        status, html = http_request("GET", url, headers=HEADERS, use_proxy=use_proxy, timeout=25)
     except JsbError as e:
         return {"status": "unavailable", "code": "NET_UNREACHABLE", "reason": str(e)}
     if status != 200 or len(html) < 50000:

@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """乐天 RWS 商品搜索（一手比价）。
 
-默认走本机代理 127.0.0.1:7890（日本站需代理可达）；缺凭证 / 代理不可达 / 返回错误时
-降级为 MOCK 兜底并给出友好提示，绝不抛异常栈。
+默认**直连**（云端服务器可直接访问日本 API）；本机开发需 JSB_PROXY=1 启用代理。
+缺凭证 / 网络不可达 / 返回错误时降级为 MOCK 兜底并给出友好提示，绝不抛异常栈。
 
 用法：
   RAKUTEN_APPLICATION_ID=.. RAKUTEN_ACCESS_KEY=.. python3 rakuten_search.py "フィギュア"
-  RAKUTEN_APPLICATION_ID=.. RAKUTEN_ACCESS_KEY=.. python3 rakuten_search.py "フィギュア" --hits 5 --no-proxy
+  JSB_PROXY=1 RAKUTEN_APPLICATION_ID=.. RAKUTEN_ACCESS_KEY=.. python3 rakuten_search.py "フィギュア" --hits 5
+  python3 rakuten_search.py "フィギュア"               # 凭证自动从 scripts/secrets.json 读取
+  python3 rakuten_search.py "フィギュア" --no-proxy   # 显式跳过代理
 """
 import argparse
 import json
 import urllib.parse
 
-from _common import load_secrets, http_request, JsbError
+from _common import load_secrets, http_request, proxy_enabled, JsbError
 
 ENDPOINT = "https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701"
 
@@ -69,8 +71,10 @@ def search(keyword, hits=5, no_proxy=False, secrets=None):
     })
     url = f"{ENDPOINT}?{params}"
 
+    # 代理策略：JSB_PROXY=1 启用（默认 0=直连）；--no-proxy 显式跳过
+    use_proxy = proxy_enabled() and not no_proxy
     try:
-        status, text = http_request("GET", url, use_proxy=not no_proxy, timeout=15)
+        status, text = http_request("GET", url, use_proxy=use_proxy, timeout=15)
     except JsbError as e:
         return _fallback(keyword, f"网络不可达：{e}", "NET_UNREACHABLE")
 

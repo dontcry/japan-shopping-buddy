@@ -3,8 +3,12 @@
 
 凭证统一从环境变量读取，杜绝硬编码；HTTP 走 urllib（无第三方依赖）。
 
-凭证优先级：环境变量 > JSB_SECRETS 指向的 JSON 文件。
-需读取的键：RAKUTEN_APPLICATION_ID / RAKUTEN_ACCESS_KEY / PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET
+凭证优先级（从高到低）：
+1. 环境变量（RAKUTEN_APPLICATION_ID / RAKUTEN_ACCESS_KEY / PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET）
+2. JSB_SECRETS 指向的 JSON 文件路径
+3. 自动发现的 secrets.json（脚本同级 → Skill 根目录 → 上级 2 层）
+
+代理：JSB_PROXY=1 启用（默认 0=不启用，云端服务器直连即可；本地开发需显式设 1）。
 """
 import base64
 import json
@@ -20,6 +24,20 @@ class JsbError(Exception):
     """业务/可预期错误：向上打印友好提示，不抛裸异常栈。"""
 
 
+def _find_secrets_json():
+    """按候选路径依次尝试找 secrets.json，返回第一个存在的。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "secrets.json"),                       # scripts/secrets.json
+        os.path.join(here, "..", "secrets.json"),                 # Skill 根/secrets.json
+        os.path.join(here, "..", "..", "secrets.json"),           # 上级 2 层
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def load_secrets():
     """返回凭证字典，键为大写环境变量名。"""
     keys = [
@@ -29,18 +47,29 @@ def load_secrets():
         "PAYPAL_CLIENT_SECRET",
     ]
     secrets = {k: os.environ.get(k) for k in keys}
-    path = os.environ.get("JSB_SECRETS")
-    if path and os.path.exists(path):
+
+    # 候选 JSON 文件：显式 JSB_SECRETS > 自动发现
+    json_paths = []
+    explicit = os.environ.get("JSB_SECRETS")
+    if explicit and os.path.isfile(explicit):
+        json_paths.append(explicit)
+    auto = _find_secrets_json()
+    if auto:
+        json_paths.append(auto)
+
+    for path in json_paths:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         for k, v in data.items():
             if isinstance(v, str) and v and not secrets.get(k):
                 secrets[k] = v
+
     return secrets
 
 
 def proxy_enabled():
-    return os.environ.get("JSB_PROXY", "1").strip().lower() not in ("0", "off", "false", "no")
+    """云端默认直连（"0"），本地开发需显式 JSB_PROXY=1 启用代理。"""
+    return os.environ.get("JSB_PROXY", "0").strip().lower() not in ("0", "off", "false", "no")
 
 
 def _opener(use_proxy):
